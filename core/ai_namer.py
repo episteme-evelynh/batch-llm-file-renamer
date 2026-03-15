@@ -48,8 +48,8 @@ MAP_SYSTEM_PROMPT = (
 )
 
 MAP_USER_PROMPT = (
-    "Summarize the following text excerpt from a document in 2-3 concise "
-    "sentences. Preserve any author names, dates, institutional affiliations, "
+    "Summarize the following text excerpt from a document in no more than "
+    "150 words. Preserve any author names, dates, institutional affiliations, "
     "journal names, DOIs, ISBNs, and key findings you find:\n\n{chunk_text}"
 )
 
@@ -61,7 +61,7 @@ REDUCE_SYSTEM_PROMPT = (
 
 REDUCE_USER_PROMPT = (
     "Below are partial summaries from different sections of the same document. "
-    "Combine them into a single coherent abstract of 3-5 sentences that "
+    "Combine them into a single coherent abstract of no more than 150 words that "
     "captures the document's main topic, authors, year, and key findings:\n\n"
     "{combined_summaries}"
 )
