@@ -1,5 +1,11 @@
-"""Main application window for the PDF/EPUB Counter & AI Renamer."""
+"""Main application window for the PDF/EPUB Counter & AI Renamer.
 
+Files are renamed automatically as each one is processed. No batch preview
+dialog is shown. If a file fails (after the worker auto-troubleshoots), a
+blocking error dialog appears with partial metadata and a custom name input.
+"""
+
+import logging
 import os
 
 from PySide6.QtCore import QSettings, Qt
@@ -20,7 +26,9 @@ from PySide6.QtWidgets import (
 
 from core.renamer import RenamerWorker
 from core.scanner import ScannerWorker
-from gui.rename_dialog import RenamePreviewDialog
+from gui.rename_dialog import ErrorRenameDialog, apply_rename
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -31,28 +39,33 @@ class MainWindow(QMainWindow):
     │  Directory: [_______________] [Browse]       │
     │  Ollama URL: [localhost:11434/v1]            │
     │  Model: [gemma3:4b-it]                      │
+    │  Mendeley Client ID: [...]                  │
+    │  Mendeley Secret: [...]                     │
     ├─────────────────────────────────────────────┤
     │  [Scan for Files]    [Cancel Scan]           │
     │  ████████████████░░░░░░░░  (progress bar)   │
     │  Current: /path/to/current/file.pdf          │
     │  Found: 42 PDF/EPUB files                    │
     ├─────────────────────────────────────────────┤
-    │  [Generate AI Names]  [Cancel]               │
+    │  [Rename Files]  [Cancel]                    │
     │  ████████████████░░░░░░░░  (progress bar)   │
-    │  Processing: /path/to/file.pdf               │
-    │  Processed: 12 / 42 files                    │
+    │  Status: AI processing file.pdf              │
+    │  Renamed: 12 / 42 | Errors: 0               │
     └─────────────────────────────────────────────┘
     """
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PDF/EPUB Counter & AI Renamer")
-        self.setMinimumSize(700, 480)
+        self.setMinimumSize(700, 520)
 
         self._settings = QSettings("BatchLLMRenamer", "BatchLLMRenamer")
         self._scanner_worker = None
         self._renamer_worker = None
         self._found_files: list[str] = []
+        self._rename_success = 0
+        self._rename_errors = 0
+        self._rename_skipped = 0
 
         self._build_ui()
         self._load_settings()
@@ -151,7 +164,7 @@ class MainWindow(QMainWindow):
         rename_layout = QVBoxLayout(rename_group)
 
         rename_btn_row = QHBoxLayout()
-        self.rename_btn = QPushButton("Generate AI Names")
+        self.rename_btn = QPushButton("Rename Files")
         self.rename_btn.setEnabled(False)
         self.rename_btn.clicked.connect(self._start_rename)
         rename_btn_row.addWidget(self.rename_btn)
@@ -169,12 +182,12 @@ class MainWindow(QMainWindow):
         self.rename_progress.setVisible(False)
         rename_layout.addWidget(self.rename_progress)
 
-        self.rename_file_label = QLabel("")
-        self.rename_file_label.setSizePolicy(
+        self.rename_status_label = QLabel("")
+        self.rename_status_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
-        self.rename_file_label.setWordWrap(False)
-        rename_layout.addWidget(self.rename_file_label)
+        self.rename_status_label.setWordWrap(False)
+        rename_layout.addWidget(self.rename_status_label)
 
         self.rename_count_label = QLabel("")
         self.rename_count_label.setStyleSheet("font-weight: bold;")
@@ -186,7 +199,7 @@ class MainWindow(QMainWindow):
         main_layout.addStretch()
 
     def _load_settings(self):
-        """Load persisted settings (Ollama URL, model, Mendeley creds)."""
+        """Load persisted settings."""
         url = self._settings.value("ollama_url", "http://localhost:11434/v1")
         model = self._settings.value("model", "gemma3:4b-it")
         self.ollama_url_input.setText(url)
@@ -259,7 +272,6 @@ class MainWindow(QMainWindow):
             self._scanner_worker.requestInterruption()
 
     def _on_file_found(self, filepath: str):
-        # Elide long paths for display
         display = filepath
         if len(display) > 80:
             display = "..." + display[-77:]
@@ -293,16 +305,21 @@ class MainWindow(QMainWindow):
 
         self._save_settings()
 
+        # Reset counters
+        self._rename_success = 0
+        self._rename_errors = 0
+        self._rename_skipped = 0
+
         # Reset rename UI
-        self.rename_progress.setRange(0, len(self._found_files))
+        total = len(self._found_files)
+        self.rename_progress.setRange(0, total)
         self.rename_progress.setValue(0)
         self.rename_progress.setVisible(True)
-        self.rename_file_label.setText("Starting AI processing...")
-        self.rename_count_label.setText(
-            f"Processed: 0 / {len(self._found_files)} files"
-        )
+        self.rename_status_label.setText("Starting AI processing...")
+        self.rename_count_label.setText(f"Processed: 0 / {total}")
         self.rename_btn.setEnabled(False)
         self.cancel_rename_btn.setEnabled(True)
+        self.scan_btn.setEnabled(False)
 
         self._renamer_worker = RenamerWorker(
             files=self._found_files,
@@ -312,11 +329,9 @@ class MainWindow(QMainWindow):
             mendeley_client_secret=self.mendeley_secret_input.text().strip(),
         )
         self._renamer_worker.progress.connect(self._on_rename_progress)
-        self._renamer_worker.current_file.connect(self._on_rename_file)
-        self._renamer_worker.error_occurred.connect(self._on_rename_error)
-        self._renamer_worker.finished_proposals.connect(
-            self._on_rename_finished
-        )
+        self._renamer_worker.status_update.connect(self._on_status_update)
+        self._renamer_worker.proposal_ready.connect(self._on_proposal_ready)
+        self._renamer_worker.finished_all.connect(self._on_all_finished)
         self._renamer_worker.start()
 
     def _cancel_rename(self):
@@ -325,29 +340,102 @@ class MainWindow(QMainWindow):
 
     def _on_rename_progress(self, current: int, total: int):
         self.rename_progress.setValue(current)
-        self.rename_count_label.setText(
-            f"Processed: {current} / {total} files"
+
+    def _on_status_update(self, status: str):
+        """Real-time status from the worker (extraction, troubleshooting, AI)."""
+        display = status
+        if len(display) > 90:
+            display = display[:87] + "..."
+        self.rename_status_label.setText(display)
+
+    def _on_proposal_ready(self, proposal):
+        """Handle each file as it completes — auto-rename or show error dialog.
+
+        Called once per file from the worker thread's signal. Successful
+        proposals are renamed immediately. Errors trigger a blocking dialog.
+        """
+        total = len(self._found_files)
+
+        if not proposal.error:
+            # --- Success: auto-rename, no dialog ---
+            try:
+                apply_rename(proposal.original_path, proposal.proposed_name)
+                self._rename_success += 1
+            except OSError as e:
+                # Rename itself failed (permissions, disk full, etc.)
+                logger.error(
+                    "Auto-rename failed for %s: %s", proposal.original_path, e
+                )
+                self._handle_error_proposal(proposal, f"Rename failed: {e}")
+                return
+        else:
+            # --- Error: show blocking dialog ---
+            self._handle_error_proposal(proposal, proposal.error)
+
+        self._update_rename_counts(total)
+
+    def _handle_error_proposal(self, proposal, error_msg: str):
+        """Show the error dialog with metadata and a custom name input."""
+        dialog = ErrorRenameDialog(
+            original_path=proposal.original_path,
+            error_msg=error_msg,
+            metadata=proposal.metadata,
+            parent=self,
         )
 
-    def _on_rename_file(self, filepath: str):
-        display = filepath
-        if len(display) > 80:
-            display = "..." + display[-77:]
-        self.rename_file_label.setText(f"Processing: {display}")
+        if dialog.exec() == ErrorRenameDialog.DialogCode.Accepted:
+            # User provided a custom name
+            try:
+                apply_rename(proposal.original_path, dialog.custom_name)
+                self._rename_success += 1
+            except OSError as e:
+                logger.error(
+                    "Custom rename failed for %s: %s",
+                    proposal.original_path, e,
+                )
+                QMessageBox.critical(
+                    self, "Rename Failed",
+                    f"Could not rename file:\n{e}",
+                )
+                self._rename_errors += 1
+        else:
+            # User clicked Skip
+            self._rename_skipped += 1
 
-    def _on_rename_error(self, filepath: str, error_msg: str):
-        # Log but don't interrupt — errors are shown in the preview dialog
-        pass
+    def _update_rename_counts(self, total: int):
+        """Update the summary label below the progress bar."""
+        processed = self._rename_success + self._rename_errors + self._rename_skipped
+        parts = [f"Processed: {processed} / {total}"]
+        if self._rename_success:
+            parts.append(f"Renamed: {self._rename_success}")
+        if self._rename_errors:
+            parts.append(f"Errors: {self._rename_errors}")
+        if self._rename_skipped:
+            parts.append(f"Skipped: {self._rename_skipped}")
+        self.rename_count_label.setText(" | ".join(parts))
 
-    def _on_rename_finished(self, proposals: list):
+    def _on_all_finished(self, success_count: int, error_count: int):
+        """Called when the worker has finished processing all files."""
         self.rename_progress.setVisible(False)
         self.rename_btn.setEnabled(True)
         self.cancel_rename_btn.setEnabled(False)
-        self.rename_file_label.setText("AI processing complete.")
+        self.scan_btn.setEnabled(True)
 
-        # Open preview dialog
-        dialog = RenamePreviewDialog(proposals, parent=self)
-        dialog.exec()
+        total = self._rename_success + self._rename_errors + self._rename_skipped
+        self.rename_status_label.setText("Complete.")
+        self._update_rename_counts(len(self._found_files))
+
+        # Summary message
+        msg_parts = [f"Renamed: {self._rename_success}"]
+        if self._rename_skipped:
+            msg_parts.append(f"Skipped: {self._rename_skipped}")
+        if self._rename_errors:
+            msg_parts.append(f"Errors: {self._rename_errors}")
+
+        QMessageBox.information(
+            self, "Rename Complete",
+            f"Finished processing {total} file(s).\n" + "\n".join(msg_parts),
+        )
 
     def closeEvent(self, event):
         """Clean up workers on window close."""
