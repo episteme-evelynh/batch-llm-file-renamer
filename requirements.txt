@@ -1,0 +1,5 @@
+PySide6>=6.7
+PyMuPDF>=1.24
+EbookLib>=0.18
+openai>=1.30
+lxml>=5.0
