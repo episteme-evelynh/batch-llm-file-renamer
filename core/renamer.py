@@ -1,21 +1,17 @@
-"""Renamer worker: orchestrates text extraction, AI summarization, and filename generation.
+"""Per-file AI rename pipeline as a pure function for QThreadPool.
 
-Runs on a background QThread. Renames happen automatically for successful files
-(no user interaction needed). On errors, the worker first tries to troubleshoot
-(retry with different parameters) before reporting the failure so the GUI can
-show an error dialog for manual naming.
+Replaces the old QThread subclass with ``process_file()`` — a plain
+function that runs one file through extract → AI → bib → filename.
+It is designed to be mapped over a file list via ``MapRunner.map()``.
 
-For each file the pipeline also:
-- Generates a .bib sidecar file using bibtex-gen (DOI lookup) and bibtex-cleaner
-- Combines the service-provided title (from DOI) with the LLM-distilled title
-  in the final filename, following Zotero naming conventions
+The function accepts ``cancel_event`` and ``progress_callback`` from
+the concurrency layer, enabling cooperative cancellation and live
+status updates without any QObject / QThread coupling.
 """
 
 import logging
 import os
 import time
-
-from PySide6.QtCore import QThread, Signal
 
 from core.ai_namer import GemmaNamer
 from core.bib_generator import combine_titles, generate_bib_file
@@ -31,7 +27,7 @@ _MIN_TEXT_LENGTH = 200
 
 
 class RenameProposal:
-    """A proposed file rename with metadata."""
+    """Result of processing a single file through the AI pipeline."""
 
     __slots__ = (
         "original_path", "proposed_name", "metadata", "error", "bib_path",
@@ -52,226 +48,229 @@ class RenameProposal:
         self.bib_path = bib_path
 
 
-class RenamerWorker(QThread):
-    """Processes files through the AI pipeline, auto-renaming on success.
+# ---------------------------------------------------------------------------
+# Pipeline configuration (passed through MapRunner shared kwargs)
+# ---------------------------------------------------------------------------
 
-    Pipeline per file:
-    1. Extract text (with troubleshooting retries on failure)
-    2. Chunk text → Map summarize → Reduce → Extract metadata
-    3. Generate .bib sidecar via bibtex-gen + bibtex-cleaner
-    4. Combine service title (from DOI) with LLM title
-    5. Build Zotero-friendly filename
-    6. Emit proposal (success or error after exhausting retries)
+class RenameConfig:
+    """Immutable config bundle passed to every ``process_file`` call."""
 
-    The GUI auto-renames successful proposals and shows an error dialog
-    only for failures.
-    """
-
-    # Signals for GUI
-    progress = Signal(int, int)          # (current_index, total_count)
-    current_file = Signal(str)           # path of file being processed
-    status_update = Signal(str)          # real-time status text
-    proposal_ready = Signal(object)      # RenameProposal (success or error)
-    finished_all = Signal(int, int)      # (success_count, error_count)
+    __slots__ = (
+        "ollama_url", "model", "mendeley_client_id", "mendeley_client_secret",
+        "_namer",
+    )
 
     def __init__(
         self,
-        files: list[str],
         ollama_url: str = "http://localhost:11434/v1",
         model: str = "gemma3:4b-it",
         mendeley_client_id: str = "",
         mendeley_client_secret: str = "",
-        parent=None,
     ):
-        super().__init__(parent)
-        self.files = files
         self.ollama_url = ollama_url
         self.model = model
         self.mendeley_client_id = mendeley_client_id
         self.mendeley_client_secret = mendeley_client_secret
+        # Lazily created GemmaNamer (shared across sequential calls,
+        # or one per thread when running in parallel)
+        self._namer = None
 
-    def run(self):
-        """Process all files, emitting proposals one at a time."""
-        namer = GemmaNamer(base_url=self.ollama_url, model=self.model)
-        total = len(self.files)
-        success_count = 0
-        error_count = 0
+    def get_namer(self) -> GemmaNamer:
+        """Return a (cached) GemmaNamer for the current thread."""
+        if self._namer is None:
+            self._namer = GemmaNamer(
+                base_url=self.ollama_url, model=self.model,
+            )
+        return self._namer
 
-        for i, filepath in enumerate(self.files):
-            if self.isInterruptionRequested():
+
+# ---------------------------------------------------------------------------
+# The mapped function — one call per file
+# ---------------------------------------------------------------------------
+
+def process_file(
+    filepath: str,
+    *,
+    config: RenameConfig,
+    cancel_event=None,
+    progress_callback=None,
+) -> RenameProposal:
+    """Run the full AI rename pipeline on a single file.
+
+    This is the function passed to ``MapRunner.map(process_file, files,
+    config=config)``.  It returns a ``RenameProposal`` (success or error
+    after exhausting troubleshooting retries).
+
+    Pipeline:
+    1. Extract text (with troubleshooting retries)
+    2. AI metadata extraction (with retries)
+    3. Generate .bib sidecar
+    4. Combine service + LLM titles
+    5. Build Zotero filename
+    """
+    basename = os.path.basename(filepath)
+    namer = config.get_namer()
+
+    def _cancelled():
+        return cancel_event and cancel_event.is_set()
+
+    def _status(msg):
+        if progress_callback:
+            progress_callback(msg)
+
+    # --- Step 1: Text extraction with troubleshooting ---
+    text, extraction_error = _extract_with_troubleshoot(
+        filepath, basename, _cancelled, _status,
+    )
+
+    if not text or not text.strip():
+        return RenameProposal(
+            original_path=filepath,
+            error=extraction_error or "No text could be extracted from file",
+        )
+
+    # --- Step 2: AI metadata extraction with troubleshooting ---
+    metadata, ai_error = _ai_metadata_with_troubleshoot(
+        text, basename, namer, _cancelled, _status,
+    )
+
+    if not metadata:
+        return RenameProposal(
+            original_path=filepath,
+            error=ai_error or "AI metadata extraction failed",
+        )
+
+    # --- Step 3-5: Bib sidecar + combined title + Zotero filename ---
+    try:
+        return _build_proposal(filepath, metadata, config, _status)
+    except Exception as e:
+        logger.exception("Failed to build proposal for %s", filepath)
+        return RenameProposal(
+            original_path=filepath,
+            metadata=metadata,
+            error=f"Filename generation failed: {e}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Internal pipeline stages
+# ---------------------------------------------------------------------------
+
+def _extract_with_troubleshoot(filepath, basename, cancelled, status):
+    """Extract text, retrying with more pages on short/empty results."""
+    text = ""
+    error = ""
+
+    status(f"Extracting text: {basename}")
+    try:
+        text = extract_text(filepath)
+    except Exception as e:
+        error = str(e)
+        logger.warning("Initial extraction failed for %s: %s", basename, e)
+
+    # Retry with more pages if text is too short
+    if not text or len(text.strip()) < _MIN_TEXT_LENGTH:
+        for max_pages in _RETRY_MAX_PAGES:
+            if cancelled():
                 break
+            status(f"Troubleshooting: retrying with {max_pages} pages: {basename}")
+            try:
+                text = extract_text(filepath, max_pages=max_pages)
+                if text and len(text.strip()) >= _MIN_TEXT_LENGTH:
+                    error = ""
+                    break
+            except Exception as e:
+                error = str(e)
+                logger.warning(
+                    "Retry extraction (%d pages) failed for %s: %s",
+                    max_pages, basename, e,
+                )
 
-            self.current_file.emit(filepath)
-            self.progress.emit(i + 1, total)
-
-            proposal = self._process_with_troubleshoot(filepath, namer)
-            self.proposal_ready.emit(proposal)
-
-            if proposal.error:
-                error_count += 1
-            else:
-                success_count += 1
-
-        self.finished_all.emit(success_count, error_count)
-
-    def _process_with_troubleshoot(
-        self, filepath: str, namer: GemmaNamer,
-    ) -> RenameProposal:
-        """Try the full pipeline, troubleshooting failures in real-time.
-
-        Troubleshooting sequence:
-        1. Normal extraction (15 pages/items)
-        2. If text too short or empty → retry with 30 pages, then 50
-        3. If text extraction throws → retry once after a brief pause
-        4. If AI metadata extraction returns fallback → retry the AI call
-        5. If all retries exhausted → return error proposal
-        """
-        basename = os.path.basename(filepath)
-
-        # --- Step 1: Text extraction with retries ---
-        text = ""
-        extraction_error = ""
-
-        self.status_update.emit(f"Extracting text: {basename}")
+    # Retry after a brief pause if extraction threw
+    if error and (not text or not text.strip()):
+        status(f"Troubleshooting: retrying extraction after pause: {basename}")
+        time.sleep(0.5)
         try:
             text = extract_text(filepath)
+            if text and text.strip():
+                error = ""
         except Exception as e:
-            extraction_error = str(e)
-            logger.warning("Initial extraction failed for %s: %s", basename, e)
+            error = str(e)
 
-        # Troubleshoot: too short or empty text
-        if not text or len(text.strip()) < _MIN_TEXT_LENGTH:
-            for max_pages in _RETRY_MAX_PAGES:
-                if self.isInterruptionRequested():
-                    break
-                self.status_update.emit(
-                    f"Troubleshooting: retrying with {max_pages} pages: {basename}"
-                )
-                try:
-                    text = extract_text(filepath, max_pages=max_pages)
-                    if text and len(text.strip()) >= _MIN_TEXT_LENGTH:
-                        extraction_error = ""
-                        break
-                except Exception as e:
-                    extraction_error = str(e)
-                    logger.warning(
-                        "Retry extraction (%d pages) failed for %s: %s",
-                        max_pages, basename, e,
-                    )
+    return text, error
 
-        # Troubleshoot: extraction threw but we haven't retried yet
-        if extraction_error and (not text or not text.strip()):
-            self.status_update.emit(
-                f"Troubleshooting: retrying extraction after pause: {basename}"
-            )
-            time.sleep(0.5)
+
+def _ai_metadata_with_troubleshoot(text, basename, namer, cancelled, status):
+    """Call the AI namer, retrying on fallback/empty results."""
+    metadata = None
+    error = ""
+
+    status(f"AI processing: {basename}")
+    try:
+        metadata = namer.generate_metadata(text)
+    except Exception as e:
+        error = str(e)
+        logger.warning("AI metadata failed for %s: %s", basename, e)
+
+    # Retry if AI returned obviously empty/fallback metadata
+    if metadata and _is_fallback_metadata(metadata):
+        if not cancelled():
+            status(f"Troubleshooting: retrying AI with more text: {basename}")
             try:
-                text = extract_text(filepath)
-                if text and text.strip():
-                    extraction_error = ""
-            except Exception as e:
-                extraction_error = str(e)
-
-        # Final check — no text at all
-        if not text or not text.strip():
-            return RenameProposal(
-                original_path=filepath,
-                error=extraction_error or "No text could be extracted from file",
-            )
-
-        # --- Step 2-3: AI metadata extraction with retry ---
-        metadata = None
-        ai_error = ""
-
-        self.status_update.emit(f"AI processing: {basename}")
-        try:
-            metadata = namer.generate_metadata(text)
-        except Exception as e:
-            ai_error = str(e)
-            logger.warning("AI metadata failed for %s: %s", basename, e)
-
-        # Troubleshoot: AI returned fallback metadata (empty authors + "Untitled")
-        if metadata and self._is_fallback_metadata(metadata):
-            self.status_update.emit(
-                f"Troubleshooting: retrying AI with more text: {basename}"
-            )
-            try:
-                # Retry with the full extracted text (not truncated)
                 metadata = namer.generate_metadata(text)
             except Exception as e:
-                ai_error = str(e)
+                error = str(e)
 
-        # Troubleshoot: AI call itself failed
-        if ai_error and not metadata:
-            self.status_update.emit(
-                f"Troubleshooting: retrying AI call: {basename}"
-            )
+    # Retry if the call itself failed
+    if error and not metadata:
+        if not cancelled():
+            status(f"Troubleshooting: retrying AI call: {basename}")
             time.sleep(1.0)
             try:
                 metadata = namer.generate_metadata(text)
-                ai_error = ""
+                error = ""
             except Exception as e:
-                ai_error = str(e)
+                error = str(e)
 
-        if not metadata:
-            return RenameProposal(
-                original_path=filepath,
-                error=ai_error or "AI metadata extraction failed",
-            )
+    return metadata, error
 
-        # --- Step 4: Build proposal ---
-        try:
-            return self._build_proposal(filepath, metadata)
-        except Exception as e:
-            logger.exception("Failed to build proposal for %s", filepath)
-            return RenameProposal(
-                original_path=filepath,
-                metadata=metadata,
-                error=f"Filename generation failed: {e}",
-            )
 
-    def _build_proposal(
-        self, filepath: str, metadata: dict,
-    ) -> RenameProposal:
-        """Build the rename proposal: .bib sidecar + combined title + filename."""
-        llm_title = metadata.get("title", "Untitled")
-        directory = os.path.dirname(filepath)
-        stem = os.path.splitext(os.path.basename(filepath))[0]
+def _build_proposal(filepath, metadata, config, status):
+    """Generate .bib sidecar, combine titles, build Zotero filename."""
+    llm_title = metadata.get("title", "Untitled")
+    directory = os.path.dirname(filepath)
+    stem = os.path.splitext(os.path.basename(filepath))[0]
 
-        self.status_update.emit(
-            f"Generating .bib: {os.path.basename(filepath)}"
-        )
+    status(f"Generating .bib: {os.path.basename(filepath)}")
 
-        bib_path, service_title = generate_bib_file(
-            metadata=metadata,
-            output_dir=directory,
-            base_filename=stem,
-            mendeley_client_id=self.mendeley_client_id,
-            mendeley_client_secret=self.mendeley_client_secret,
-        )
+    bib_path, service_title = generate_bib_file(
+        metadata=metadata,
+        output_dir=directory,
+        base_filename=stem,
+        mendeley_client_id=config.mendeley_client_id,
+        mendeley_client_secret=config.mendeley_client_secret,
+    )
 
-        # Combine service title with LLM title
-        combined_title = combine_titles(service_title, llm_title)
-        metadata["title"] = combined_title
+    combined_title = combine_titles(service_title, llm_title)
+    metadata["title"] = combined_title
 
-        # Build Zotero filename
-        _, ext = os.path.splitext(filepath)
-        proposed_name = build_zotero_filename(metadata, ext)
+    _, ext = os.path.splitext(filepath)
+    proposed_name = build_zotero_filename(metadata, ext)
 
-        return RenameProposal(
-            original_path=filepath,
-            proposed_name=proposed_name,
-            metadata=metadata,
-            bib_path=bib_path,
-        )
+    return RenameProposal(
+        original_path=filepath,
+        proposed_name=proposed_name,
+        metadata=metadata,
+        bib_path=bib_path,
+    )
 
-    @staticmethod
-    def _is_fallback_metadata(metadata: dict) -> bool:
-        """Check if metadata looks like the fallback/empty result."""
-        authors = metadata.get("authors", [])
-        title = metadata.get("title", "")
-        return (
-            not authors
-            and title in ("Untitled", "")
-            and not metadata.get("year", "")
-        )
+
+def _is_fallback_metadata(metadata: dict) -> bool:
+    """Check if metadata looks like the fallback/empty result."""
+    authors = metadata.get("authors", [])
+    title = metadata.get("title", "")
+    return (
+        not authors
+        and title in ("Untitled", "")
+        and not metadata.get("year", "")
+    )

@@ -1,63 +1,50 @@
-"""Recursive PDF/EPUB file scanner running on a background QThread."""
+"""Recursive PDF/EPUB file scanner using QThreadPool.
+
+Replaces the old QThread subclass with a plain function that runs on
+the global QThreadPool via ``TaskRunner``.  The function accepts
+``cancel_event`` and ``progress_callback`` from the concurrency layer,
+so it can be cancelled cooperatively and emit live progress.
+"""
 
 import os
-
-from PySide6.QtCore import QThread, Signal
-
 
 SUPPORTED_EXTENSIONS = {".pdf", ".epub"}
 
 
-class ScannerWorker(QThread):
-    """Recursively discovers PDF and EPUB files in a directory tree.
+def scan_directory(root_dir, *, cancel_event=None, progress_callback=None):
+    """Walk *root_dir* and return a list of PDF/EPUB file paths.
 
-    Runs on a background thread to keep the GUI responsive.
-    Emits signals for each file found (for live counter/label updates)
-    and a final signal with the complete file list.
+    This is a plain function (no QObject inheritance needed).  It is
+    designed to be submitted to ``TaskRunner.run()`` which supplies
+    the ``cancel_event`` and ``progress_callback`` keyword arguments.
 
-    The progress bar should be set to indeterminate/busy mode during
-    scanning since the total file count is unknown upfront.
+    Progress updates are dicts with keys:
+        file_found (str)  — full path of the file just discovered
+        count (int)       — running total of files found so far
     """
+    found_files = []
+    count = 0
 
-    file_found = Signal(str)     # Emitted for each file: full path
-    count_updated = Signal(int)  # Emitted with running total count
-    finished_scan = Signal(list) # Emitted when done: full list of paths
-    error = Signal(str)          # Emitted on unrecoverable errors
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        if cancel_event and cancel_event.is_set():
+            break
 
-    def __init__(self, root_dir: str, parent=None):
-        super().__init__(parent)
-        self.root_dir = root_dir
+        # Skip hidden directories (e.g., .git, .Spotlight-V100)
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
 
-    def run(self):
-        """Walk the directory tree and emit signals for each PDF/EPUB found."""
-        found_files = []
-        count = 0
+        for filename in filenames:
+            if cancel_event and cancel_event.is_set():
+                break
 
-        try:
-            for dirpath, dirnames, filenames in os.walk(self.root_dir):
-                if self.isInterruptionRequested():
-                    break
+            _, ext = os.path.splitext(filename)
+            if ext.lower() in SUPPORTED_EXTENSIONS:
+                full_path = os.path.join(dirpath, filename)
+                found_files.append(full_path)
+                count += 1
+                if progress_callback:
+                    progress_callback({
+                        "file_found": full_path,
+                        "count": count,
+                    })
 
-                # Skip hidden directories (e.g., .git, .Spotlight-V100)
-                dirnames[:] = [
-                    d for d in dirnames if not d.startswith(".")
-                ]
-
-                for filename in filenames:
-                    if self.isInterruptionRequested():
-                        break
-
-                    _, ext = os.path.splitext(filename)
-                    if ext.lower() in SUPPORTED_EXTENSIONS:
-                        full_path = os.path.join(dirpath, filename)
-                        found_files.append(full_path)
-                        count += 1
-                        self.file_found.emit(full_path)
-                        self.count_updated.emit(count)
-
-        except PermissionError as e:
-            self.error.emit(f"Permission denied: {e}")
-        except Exception as e:
-            self.error.emit(f"Scan error: {e}")
-
-        self.finished_scan.emit(found_files)
+    return found_files
