@@ -202,6 +202,16 @@ class RenamePreviewDialog(QDialog):
                 success += 1
                 logger.info("Renamed: %s -> %s", original_path, new_path)
 
+                # Also rename the .bib sidecar if it exists
+                old_stem = os.path.splitext(os.path.basename(original_path))[0]
+                new_stem = os.path.splitext(os.path.basename(new_path))[0]
+                old_bib = os.path.join(directory, old_stem + ".bib")
+                if os.path.exists(old_bib):
+                    new_bib = os.path.join(directory, new_stem + ".bib")
+                    new_bib = _resolve_collision(new_bib)
+                    os.rename(old_bib, new_bib)
+                    logger.info("Renamed .bib: %s -> %s", old_bib, new_bib)
+
             except Exception as e:
                 errors.append(f"{os.path.basename(original_path)}: {e}")
                 logger.exception("Rename failed: %s", original_path)

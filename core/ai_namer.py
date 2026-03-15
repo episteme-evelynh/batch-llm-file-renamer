@@ -81,7 +81,9 @@ METADATA_USER_PROMPT = (
     'manuscript, conference_paper, report, unknown>",\n'
     '  "authors": ["<LastName1>", "<LastName2>"],\n'
     '  "year": "<YYYY or empty string if unknown>",\n'
-    '  "title": "<concise document title, max 80 characters>"\n'
+    '  "title": "<concise document title, max 80 characters>",\n'
+    '  "doi": "<DOI string like 10.xxxx/yyyy or empty string if not found>",\n'
+    '  "isbn": "<ISBN string or empty string if not found>"\n'
     '}}'
 )
 
@@ -311,6 +313,8 @@ def _parse_metadata_json(response: str) -> dict:
         "authors": _validate_authors(data.get("authors", [])),
         "year": _validate_year(data.get("year", "")),
         "title": str(data.get("title", "Untitled")).strip()[:80],
+        "doi": _validate_doi(data.get("doi", "")),
+        "isbn": str(data.get("isbn", "")).strip(),
     }
 
 
@@ -343,6 +347,13 @@ def _validate_year(year) -> str:
     return match.group(1) if match else ""
 
 
+def _validate_doi(doi) -> str:
+    """Extract a plausible DOI string (10.xxxx/yyyy format)."""
+    doi_str = str(doi).strip()
+    match = re.search(r"(10\.\d{4,}/[^\s]+)", doi_str)
+    return match.group(1) if match else ""
+
+
 def _fallback_metadata() -> dict:
     """Return default metadata when extraction fails."""
     return {
@@ -350,4 +361,6 @@ def _fallback_metadata() -> dict:
         "authors": [],
         "year": "",
         "title": "Untitled",
+        "doi": "",
+        "isbn": "",
     }

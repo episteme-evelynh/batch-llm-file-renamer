@@ -106,12 +106,13 @@ def build_zotero_filename(metadata: dict, extension: str) -> str:
     title = title.strip().rstrip(".")
     title = re.sub(r"\s+", " ", title)
 
-    # Truncate overly long titles (keep under 80 chars for readability)
-    if len(title) > 80:
+    # Truncate overly long titles (keep under 120 chars for readability;
+    # combined service + LLM titles may be longer than single-source titles)
+    if len(title) > 120:
         # Try to break at a word boundary
-        truncated = title[:77]
+        truncated = title[:117]
         last_space = truncated.rfind(" ")
-        if last_space > 40:
+        if last_space > 50:
             title = truncated[:last_space]
         else:
             title = truncated

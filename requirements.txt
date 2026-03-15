@@ -3,3 +3,5 @@ PyMuPDF>=1.24
 EbookLib>=0.18
 openai>=1.30
 lxml>=5.0
+bibtex-gen>=0.2.0
+bibtex-cleaner>=0.1.0

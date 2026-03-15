@@ -93,6 +93,22 @@ class MainWindow(QMainWindow):
         model_row.addWidget(self.model_input)
         config_layout.addLayout(model_row)
 
+        # Mendeley credentials (for bibtex-gen DOI lookup)
+        mendeley_id_row = QHBoxLayout()
+        mendeley_id_row.addWidget(QLabel("Mendeley Client ID:"))
+        self.mendeley_id_input = QLineEdit()
+        self.mendeley_id_input.setPlaceholderText("(optional) for DOI → BibTeX lookup")
+        mendeley_id_row.addWidget(self.mendeley_id_input)
+        config_layout.addLayout(mendeley_id_row)
+
+        mendeley_secret_row = QHBoxLayout()
+        mendeley_secret_row.addWidget(QLabel("Mendeley Secret:"))
+        self.mendeley_secret_input = QLineEdit()
+        self.mendeley_secret_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.mendeley_secret_input.setPlaceholderText("(optional) for DOI → BibTeX lookup")
+        mendeley_secret_row.addWidget(self.mendeley_secret_input)
+        config_layout.addLayout(mendeley_secret_row)
+
         main_layout.addWidget(config_group)
 
         # --- Scan Section ---
@@ -170,16 +186,28 @@ class MainWindow(QMainWindow):
         main_layout.addStretch()
 
     def _load_settings(self):
-        """Load persisted settings (Ollama URL, model)."""
+        """Load persisted settings (Ollama URL, model, Mendeley creds)."""
         url = self._settings.value("ollama_url", "http://localhost:11434/v1")
         model = self._settings.value("model", "gemma3:4b-it")
         self.ollama_url_input.setText(url)
         self.model_input.setText(model)
+        self.mendeley_id_input.setText(
+            self._settings.value("mendeley_client_id", "")
+        )
+        self.mendeley_secret_input.setText(
+            self._settings.value("mendeley_client_secret", "")
+        )
 
     def _save_settings(self):
         """Persist current settings."""
         self._settings.setValue("ollama_url", self._get_ollama_url())
         self._settings.setValue("model", self._get_model())
+        self._settings.setValue(
+            "mendeley_client_id", self.mendeley_id_input.text().strip()
+        )
+        self._settings.setValue(
+            "mendeley_client_secret", self.mendeley_secret_input.text().strip()
+        )
 
     def _get_ollama_url(self) -> str:
         url = self.ollama_url_input.text().strip()
@@ -280,6 +308,8 @@ class MainWindow(QMainWindow):
             files=self._found_files,
             ollama_url=self._get_ollama_url(),
             model=self._get_model(),
+            mendeley_client_id=self.mendeley_id_input.text().strip(),
+            mendeley_client_secret=self.mendeley_secret_input.text().strip(),
         )
         self._renamer_worker.progress.connect(self._on_rename_progress)
         self._renamer_worker.current_file.connect(self._on_rename_file)
