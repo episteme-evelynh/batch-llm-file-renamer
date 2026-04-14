@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        No special entitlements are required for:
+          - UIDocumentPickerViewController folder access
+          - Security-scoped URLs and bookmarks on iOS
+
+        Entitlements below are the standard sandbox baseline.
+    -->
+
+    <!-- App Sandbox (required for App Store) -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Network: off by default; enable if cloud-file-provider support is added -->
+    <!-- <key>com.apple.security.network.client</key><true/> -->
+
+    <!--
+        NOTE: On macOS, bookmarks require:
+          com.apple.security.files.bookmarks.app-scope
+        On iOS, no bookmark entitlement is needed.
+    -->
+</dict>
+</plist>
